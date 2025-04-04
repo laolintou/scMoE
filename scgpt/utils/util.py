@@ -472,11 +472,11 @@ def map_raw_id_to_vocab_id(
 
 
 def load_pretrained(
-        model: torch.nn.Module,
-        pretrained_params: Mapping[str, torch.Tensor],
-        strict: bool = False,
-        prefix: Optional[List[str]] = None,
-        verbose: bool = True,
+    model: torch.nn.Module,
+    pretrained_params: Mapping[str, torch.Tensor],
+    strict: bool = False,
+    prefix: Optional[List[str]] = None,
+    verbose: bool = True,
 ) -> torch.nn.Module:
     """
     Load pretrained weights to the model.
@@ -529,6 +529,7 @@ def load_pretrained(
         model.load_state_dict(model_dict)
 
     return model
+
 
 
 class DownstreamTasks(Enum):
