@@ -1,7 +1,7 @@
 import gc
+import copy
 import math
-from typing import Dict, Mapping, Optional, Tuple, Any, Union
-
+from typing import Dict, Mapping, Optional, Tuple, Any, Union, Callable
 import torch
 import numpy as np
 from torch import nn, Tensor
@@ -10,6 +10,9 @@ import torch.nn.functional as F
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.distributions import Bernoulli
 from tqdm import trange
+from torch.nn.modules import MultiheadAttention, Linear, Dropout, LayerNorm
+
+from .loRA_rank_attention import MLA
 
 try:
     from flash_attn.flash_attention import FlashMHA
@@ -27,36 +30,42 @@ from .grad_reverse import grad_reverse
 
 class TransformerModel(nn.Module):
     def __init__(
-        self,
-        ntoken: int,
-        d_model: int,
-        nhead: int,
-        d_hid: int,
-        nlayers: int,
-        nlayers_cls: int = 3,
-        n_cls: int = 1,
-        vocab: Any = None,
-        dropout: float = 0.5,
-        pad_token: str = "<pad>",
-        pad_value: int = 0,
-        do_mvc: bool = False,
-        do_dab: bool = False,
-        use_batch_labels: bool = False,
-        num_batch_labels: Optional[int] = None,
-        domain_spec_batchnorm: Union[bool, str] = False,
-        input_emb_style: str = "continuous",
-        n_input_bins: Optional[int] = None,
-        cell_emb_style: str = "cls",
-        mvc_decoder_style: str = "inner product",
-        ecs_threshold: float = 0.3,
-        explicit_zero_prob: bool = False,
-        use_fast_transformer: bool = False,
-        fast_transformer_backend: str = "flash",
-        pre_norm: bool = False,
+            self,
+            ntoken: int,
+            d_model: int,
+            nhead: int,
+            d_hid: int,
+            nlayers: int,
+            nlayers_cls: int = 3,
+            n_cls: int = 1,
+            vocab: Any = None,
+            dropout: float = 0.5,
+            pad_token: str = "<pad>",
+            pad_value: int = 0,
+            do_mvc: bool = False,
+            do_dab: bool = False,
+            use_batch_labels: bool = False,
+            num_batch_labels: Optional[int] = None,
+            domain_spec_batchnorm: Union[bool, str] = False,
+            input_emb_style: str = "continuous",
+            n_input_bins: Optional[int] = None,
+            cell_emb_style: str = "cls",
+            mvc_decoder_style: str = "inner product",
+            ecs_threshold: float = 0.3,
+            explicit_zero_prob: bool = False,
+            use_fast_transformer: bool = False,
+            fast_transformer_backend: str = "flash",
+            pre_norm: bool = False,
+            struct:list=[],
+            qkv_rank: Any=None,
+            out_rank: Any=None,
+
     ):
         super().__init__()
         self.model_type = "Transformer"
         self.d_model = d_model
+        self.qkv_rank=qkv_rank
+        self.out_rank=out_rank
         self.do_dab = do_dab
         self.ecs_threshold = ecs_threshold
         self.use_batch_labels = use_batch_labels
@@ -65,6 +74,8 @@ class TransformerModel(nn.Module):
         self.cell_emb_style = cell_emb_style
         self.explicit_zero_prob = explicit_zero_prob
         self.norm_scheme = "pre" if pre_norm else "post"
+
+        self.struct=struct
         if self.input_emb_style not in ["category", "continuous", "scaling"]:
             raise ValueError(
                 f"input_emb_style should be one of category, continuous, scaling, "
@@ -128,17 +139,40 @@ class TransformerModel(nn.Module):
                 )
                 self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
         else:
-            encoder_layers = TransformerEncoderLayer(
-                d_model, nhead, d_hid, dropout, batch_first=True
-            )
-            self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+            # # Using original TransformerEncoder architecture if not use peft
+            # # if all(value is False for value in peft_config.values()):
+            #     encoder_layers = TransformerEncoderLayer(
+            #         d_model, nhead, d_hid, dropout, batch_first=True
+            #     )
+            #     self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+            # # else:
+            #     # Using peft TransformerEncoder architecture if use peft
+                encoder_layers = nn.ModuleList(
+                    [
+                        MoETransformerEncoderLayer(
+                            d_model,
+                            nhead,
+                            d_hid,
+                            dropout,
+                            batch_first=True,
+                            index=index,
+                            struct=self.struct,
+                            qkv_rank=self.qkv_rank,
+                            out_rank=self.out_rank,
+                        )
+                        for index in range(nlayers)
+                    ]
+                )
+                self.transformer_encoder = PeftTransformerEncoder(encoder_layers)
 
         self.decoder = ExprDecoder(
             d_model,
             explicit_zero_prob=explicit_zero_prob,
             use_batch_labels=use_batch_labels,
         )
-        self.cls_decoder = ClsDecoder(d_model, n_cls, nlayers=nlayers_cls)
+
+        if n_cls > 1:
+            self.cls_decoder = ClsDecoder(d_model, n_cls, nlayers=nlayers_cls)
         if do_mvc:
             self.mvc_decoder = MVCDecoder(
                 d_model,
@@ -165,11 +199,11 @@ class TransformerModel(nn.Module):
         self.encoder.embedding.weight.data.uniform_(-initrange, initrange)
 
     def _encode(
-        self,
-        src: Tensor,
-        values: Tensor,
-        src_key_padding_mask: Tensor,
-        batch_labels: Optional[Tensor] = None,  # (batch,)
+            self,
+            src: Tensor,
+            values: Tensor,
+            src_key_padding_mask: Tensor,
+            batch_labels: Optional[Tensor] = None,  # (batch,)
     ) -> Tensor:
         self._check_batch_labels(batch_labels)
 
@@ -197,7 +231,7 @@ class TransformerModel(nn.Module):
         return output  # (batch, seq_len, embsize)
 
     def _get_cell_emb_from_layer(
-        self, layer_output: Tensor, weights: Tensor = None
+            self, layer_output: Tensor, weights: Tensor = None
     ) -> Tensor:
         """
         Args:
@@ -232,13 +266,13 @@ class TransformerModel(nn.Module):
             )
 
     def generate(
-        self,
-        cell_emb: Tensor,
-        src: Tensor,
-        values: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        gen_iters: int = 1,
-        batch_labels: Optional[Tensor] = None,  # (batch,)
+            self,
+            cell_emb: Tensor,
+            src: Tensor,
+            values: Optional[Tensor] = None,
+            src_key_padding_mask: Optional[Tensor] = None,
+            gen_iters: int = 1,
+            batch_labels: Optional[Tensor] = None,  # (batch,)
     ) -> Tensor:
         """
         Args:
@@ -312,16 +346,16 @@ class TransformerModel(nn.Module):
         return output  # (batch, seq_len)
 
     def forward(
-        self,
-        src: Tensor,
-        values: Tensor,
-        src_key_padding_mask: Tensor,
-        batch_labels: Optional[Tensor] = None,
-        CLS: bool = False,
-        CCE: bool = False,
-        MVC: bool = False,
-        ECS: bool = False,
-        do_sample: bool = False,
+            self,
+            src: Tensor,
+            values: Tensor,
+            src_key_padding_mask: Tensor,
+            batch_labels: Optional[Tensor] = None,
+            CLS: bool = False,
+            CCE: bool = False,
+            MVC: bool = False,
+            ECS: bool = False,
+            do_sample: bool = False,
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -440,15 +474,15 @@ class TransformerModel(nn.Module):
         return output
 
     def encode_batch(
-        self,
-        src: Tensor,
-        values: Tensor,
-        src_key_padding_mask: Tensor,
-        batch_size: int,
-        batch_labels: Optional[Tensor] = None,
-        output_to_cpu: bool = True,
-        time_step: Optional[int] = None,
-        return_np: bool = False,
+            self,
+            src: Tensor,
+            values: Tensor,
+            src_key_padding_mask: Tensor,
+            batch_size: int,
+            batch_labels: Optional[Tensor] = None,
+            output_to_cpu: bool = True,
+            time_step: Optional[int] = None,
+            return_np: bool = False,
     ) -> Tensor:
         """
         Args:
@@ -480,10 +514,10 @@ class TransformerModel(nn.Module):
 
         for i in trange(0, N, batch_size):
             raw_output = self._encode(
-                src[i : i + batch_size].to(device),
-                values[i : i + batch_size].to(device),
-                src_key_padding_mask[i : i + batch_size].to(device),
-                batch_labels[i : i + batch_size].to(device)
+                src[i: i + batch_size].to(device),
+                values[i: i + batch_size].to(device),
+                src_key_padding_mask[i: i + batch_size].to(device),
+                batch_labels[i: i + batch_size].to(device)
                 if batch_labels is not None
                 else None,
             )
@@ -494,7 +528,7 @@ class TransformerModel(nn.Module):
                 output = output.numpy()
             if time_step is not None:
                 output = output[:, time_step, :]
-            outputs[i : i + batch_size] = output
+            outputs[i: i + batch_size] = output
 
         return outputs
 
@@ -506,12 +540,12 @@ def generate_square_subsequent_mask(sz: int) -> Tensor:
 
 class FastTransformerEncoderWrapper(nn.Module):
     def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        d_hid: int,
-        nlayers: int,
-        dropout: float = 0.5,
+            self,
+            d_model: int,
+            nhead: int,
+            d_hid: int,
+            nlayers: int,
+            dropout: float = 0.5,
     ):
         super().__init__()
         self.fast_transformer_encoder = self.build_fast_transformer_encoder(
@@ -520,7 +554,7 @@ class FastTransformerEncoderWrapper(nn.Module):
 
     @staticmethod
     def build_fast_transformer_encoder(
-        d_model: int, nhead: int, d_hid: int, nlayers: int, dropout: float
+            d_model: int, nhead: int, d_hid: int, nlayers: int, dropout: float
     ) -> nn.Module:
         from fast_transformers.builders import TransformerEncoderBuilder
 
@@ -545,8 +579,8 @@ class FastTransformerEncoderWrapper(nn.Module):
 
     @staticmethod
     def build_length_mask(
-        src: Tensor,
-        src_key_padding_mask: torch.BoolTensor,
+            src: Tensor,
+            src_key_padding_mask: torch.BoolTensor,
     ) -> "LengthMask":
         from fast_transformers.masking import LengthMask
 
@@ -563,9 +597,9 @@ class FastTransformerEncoderWrapper(nn.Module):
         return length_mask
 
     def forward(
-        self,
-        src: Tensor,
-        src_key_padding_mask: torch.BoolTensor,
+            self,
+            src: Tensor,
+            src_key_padding_mask: torch.BoolTensor,
     ) -> Tensor:
         """
         Args:
@@ -620,17 +654,17 @@ class FlashTransformerEncoderLayer(nn.Module):
     __constants__ = ["batch_first"]
 
     def __init__(
-        self,
-        d_model,
-        nhead,
-        dim_feedforward=2048,
-        dropout=0.1,
-        activation="relu",
-        layer_norm_eps=1e-5,
-        batch_first=True,
-        device=None,
-        dtype=None,
-        norm_scheme="post",  # "pre" or "post"
+            self,
+            d_model,
+            nhead,
+            dim_feedforward=2048,
+            dropout=0.1,
+            activation="relu",
+            layer_norm_eps=1e-5,
+            batch_first=True,
+            device=None,
+            dtype=None,
+            norm_scheme="post",  # "pre" or "post"
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -674,11 +708,11 @@ class FlashTransformerEncoderLayer(nn.Module):
         super().__setstate__(state)
 
     def forward(
-        self,
-        src: Tensor,
-        src_mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        **kwargs,
+            self,
+            src: Tensor,
+            src_mask: Optional[Tensor] = None,
+            src_key_padding_mask: Optional[Tensor] = None,
+            **kwargs,
     ) -> Tensor:
         r"""Pass the input through the encoder layer.
 
@@ -720,12 +754,417 @@ class FlashTransformerEncoderLayer(nn.Module):
         return src
 
 
+class MoETransformerEncoderLayer(nn.Module):
+    r"""TransformerEncoderLayer is made up of self-attn and feedforward network.
+    This standard encoder layer is based on the paper "Attention Is All You Need".
+    Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+    Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in
+    Neural Information Processing Systems, pages 6000-6010. Users may modify or implement
+    in a different way during application.
+
+    Args:
+        d_model: the number of expected features in the input (required).
+        nhead: the number of heads in the multiheadattention models (required).
+        dim_feedforward: the dimension of the feedforward network model (default=2048).
+        dropout: the dropout value (default=0.1).
+        activation: the activation function of the intermediate layer, can be a string
+            ("relu" or "gelu") or a unary callable. Default: relu
+        layer_norm_eps: the eps value in layer normalization components (default=1e-5).
+        batch_first: If ``True``, then the input and output tensors are provided
+            as (batch, seq, feature). Default: ``False`` (seq, batch, feature).
+        norm_first: if ``True``, layer norm is done prior to attention and feedforward
+            operations, respectively. Otherwise it's done after. Default: ``False`` (after).
+        peft_config: peft configuration (required)
+
+    Fast path:
+        forward() will use a special optimized implementation described in
+        `FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`_ if all of the following
+        conditions are met:
+
+        - Either autograd is disabled (using ``torch.inference_mode`` or ``torch.no_grad``) or no tensor
+          argument ``requires_grad``
+        - training is disabled (using ``.eval()``)
+        - batch_first is ``True`` and the input is batched (i.e., ``src.dim() == 3``)
+        - activation is one of: ``"relu"``, ``"gelu"``, ``torch.functional.relu``, or ``torch.functional.gelu``
+        - at most one of ``src_mask`` and ``src_key_padding_mask`` is passed
+        - if src is a `NestedTensor <https://pytorch.org/docs/stable/nested.html>`_, neither ``src_mask``
+          nor ``src_key_padding_mask`` is passed
+        - the two ``LayerNorm`` instances have a consistent ``eps`` value (this will naturally be the case
+          unless the caller has manually modified one without modifying the other)
+
+        If the optimized implementation is in use, a
+        `NestedTensor <https://pytorch.org/docs/stable/nested.html>`_ can be
+        passed for ``src`` to represent padding more efficiently than using a padding
+        mask. In this case, a `NestedTensor <https://pytorch.org/docs/stable/nested.html>`_ will be
+        returned, and an additional speedup proportional to the fraction of the input that
+        is padding can be expected.
+
+        .. _`FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`:
+         https://arxiv.org/abs/2205.14135
+
+    """
+    __constants__ = ['batch_first', 'norm_first']
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
+                 activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,struct:list=[],
+                 layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
+                 device=None, dtype=None, qkv_rank:int=0,out_rank:int=0,index: int = None, **kwargs) -> None:
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        if "lora_rank" in struct:
+            self.self_attn=MLA(d_model,nhead,dropout=dropout,batch_first=batch_first,qkv_rank=qkv_rank,out_rank=out_rank)
+        else:
+            self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first,
+                                                **factory_kwargs)
+
+        # Implementation of Feedforward model
+        self.linear1 = Linear(d_model, dim_feedforward, **factory_kwargs)
+        self.dropout = Dropout(dropout)
+        self.linear2 = Linear(dim_feedforward, d_model, **factory_kwargs)
+
+        self.norm_first = norm_first
+        if "RMSNorm" in struct:
+            self.norm1=RMSNorm(d_model,eps=layer_norm_eps)
+            self.norm2=RMSNorm(d_model,eps=layer_norm_eps)
+        else:
+            self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+            self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
+        self.scale = 0
+        # Legacy string support for activation function.
+        if isinstance(activation, str):
+            activation = self._get_activation_fn(activation)
+
+        # We can't test self.activation in forward() in TorchScript,
+        # so stash some information about it instead.
+        if activation is F.relu or isinstance(activation, torch.nn.ReLU):
+            self.activation_relu_or_gelu = 1
+        elif activation is F.gelu or isinstance(activation, torch.nn.GELU):
+            self.activation_relu_or_gelu = 2
+        else:
+            self.activation_relu_or_gelu = 0
+        self.activation = activation
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if not hasattr(self, 'activation'):
+            self.activation = F.relu
+
+    def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
+        if activation == "relu":
+            return F.relu
+        elif activation == "gelu":
+            return F.gelu
+
+        raise RuntimeError("activation should be relu/gelu, not {}".format(activation))
+
+    def forward(
+            self,
+            src: Tensor,
+            src_mask: Optional[Tensor] = None,
+            src_key_padding_mask: Optional[Tensor] = None,
+            is_causal: bool = False,
+            **kwargs
+    ) -> Tensor:
+        r"""Pass the input through the encoder layer.
+
+        Args:
+            src: the sequence to the encoder layer (required).
+            src_mask: the mask for the src sequence (optional).
+            is_causal: If specified, applies a causal mask as src_mask.
+              Default: ``False``.
+            src_key_padding_mask: the mask for the src keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        src_key_padding_mask = F._canonical_mask(
+            mask=src_key_padding_mask,
+            mask_name="src_key_padding_mask",
+            other_type=F._none_or_dtype(src_mask),
+            other_name="src_mask",
+            target_type=src.dtype
+        )
+
+        src_mask = F._canonical_mask(
+            mask=src_mask,
+            mask_name="src_mask",
+            other_type=None,
+            other_name="",
+            target_type=src.dtype,
+            check_other=False,
+        )
+
+        # see Fig. 1 of https://arxiv.org/pdf/2002.04745v1.pdf
+        why_not_sparsity_fast_path = ''
+        if not src.dim() == 3:
+            why_not_sparsity_fast_path = f"input not batched; expected src.dim() of 3 but got {src.dim()}"
+        elif self.training:
+            why_not_sparsity_fast_path = "training is enabled"
+        elif not self.self_attn.batch_first:
+            why_not_sparsity_fast_path = "self_attn.batch_first was not True"
+        elif not self.self_attn._qkv_same_embed_dim:
+            why_not_sparsity_fast_path = "self_attn._qkv_same_embed_dim was not True"
+        elif not self.activation_relu_or_gelu:
+            why_not_sparsity_fast_path = "activation_relu_or_gelu was not True"
+        elif not (self.norm1.eps == self.norm2.eps):
+            why_not_sparsity_fast_path = "norm1.eps is not equal to norm2.eps"
+        elif src.is_nested and (src_key_padding_mask is not None or src_mask is not None):
+            why_not_sparsity_fast_path = "neither src_key_padding_mask nor src_mask are not supported with NestedTensor input"
+        elif self.self_attn.num_heads % 2 == 1:
+            why_not_sparsity_fast_path = "num_head is odd"
+        elif torch.is_autocast_enabled():
+            why_not_sparsity_fast_path = "autocast is enabled"
+        if not why_not_sparsity_fast_path:
+            tensor_args = (
+                src,
+                self.self_attn.in_proj_weight,
+                self.self_attn.in_proj_bias,
+                self.self_attn.out_proj.weight,
+                self.self_attn.out_proj.bias,
+                self.norm1.weight,
+                self.norm1.bias,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.linear1.weight,
+                self.linear1.bias,
+                self.linear2.weight,
+                self.linear2.bias,
+            )
+
+            # We have to use list comprehensions below because TorchScript does not support
+            # generator expressions.
+            if torch.overrides.has_torch_function(tensor_args):
+                why_not_sparsity_fast_path = "some Tensor argument has_torch_function"
+            elif not all((x.is_cuda or 'cpu' in str(x.device)) for x in tensor_args):
+                why_not_sparsity_fast_path = "some Tensor argument is neither CUDA nor CPU"
+            elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args):
+                why_not_sparsity_fast_path = ("grad is enabled and at least one of query or the "
+                                              "input/output projection weights or biases requires_grad")
+
+            if not why_not_sparsity_fast_path:
+                merged_mask, mask_type = self.self_attn.merge_masks(src_mask, src_key_padding_mask, src)
+                return torch._transformer_encoder_layer_fwd(
+                    src,
+                    self.self_attn.embed_dim,
+                    self.self_attn.num_heads,
+                    self.self_attn.in_proj_weight,
+                    self.self_attn.in_proj_bias,
+                    self.self_attn.out_proj.weight,
+                    self.self_attn.out_proj.bias,
+                    self.activation_relu_or_gelu == 2,
+                    self.norm_first,
+                    self.norm1.eps,
+                    self.norm1.weight,
+                    self.norm1.bias,
+                    self.norm2.weight,
+                    self.norm2.bias,
+                    self.linear1.weight,
+                    self.linear1.bias,
+                    self.linear2.weight,
+                    self.linear2.bias,
+                    merged_mask,
+                    mask_type,
+                )
+
+
+        x = src
+        if self.norm_first:
+            x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, is_causal=is_causal)
+            x = x + self._ff_block(self.norm2(x))
+        else:
+            x = self.norm1(x + self._sa_block(x, src_mask, src_key_padding_mask, is_causal=is_causal))
+            x = self.norm2(x + self._ff_block(x))
+
+        return x
+
+    # self-attention block
+    def _sa_block(self, x: Tensor,
+                  attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool = False) -> Tensor:
+        x = self.self_attn(x, x, x,
+                           attn_mask=attn_mask,
+                           key_padding_mask=key_padding_mask,
+                           need_weights=False, is_causal=is_causal)[0]
+        return self.dropout1(x)
+
+    # feed forward block
+    def _ff_block(self, x: Tensor) -> Tensor:
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout2(x)
+
+
+class PeftTransformerEncoder(nn.Module):
+    r"""TransformerEncoder is a stack of N encoder layers. Users can build the
+    BERT(https://arxiv.org/abs/1810.04805) model with corresponding parameters.
+
+    Args:
+        encoder_layer: an instance of the TransformerEncoderLayer() class (required).
+        num_layers: the number of sub-encoder-layers in the encoder (required).
+        norm: the layer normalization component (optional).
+        enable_nested_tensor: if True, input will automatically convert to nested tensor
+            (and convert back on output). This will improve the overall performance of
+            TransformerEncoder when padding rate is high. Default: ``True`` (enabled).
+
+    Examples::
+        >>> encoder_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8)
+        >>> transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=6)
+        >>> src = torch.rand(10, 32, 512)
+        >>> out = transformer_encoder(src)
+    """
+    __constants__ = ['norm']
+
+    def __init__(self, encoder_layer, norm=None, enable_nested_tensor=True, mask_check=True):
+        super().__init__()
+        torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
+        self.layers = encoder_layer
+        self.norm = norm
+        self.enable_nested_tensor = enable_nested_tensor
+        self.mask_check = mask_check
+
+    def forward(
+            self,
+            src: Tensor,
+            mask: Optional[Tensor] = None,
+            src_key_padding_mask: Optional[Tensor] = None,
+            is_causal: Optional[bool] = None) -> Tensor:
+        r"""Pass the input through the encoder layers in turn.
+
+        Args:
+            src: the sequence to the encoder (required).
+            mask: the mask for the src sequence (optional).
+            is_causal: If specified, applies a causal mask as mask (optional)
+                and ignores attn_mask for computing scaled dot product attention.
+                Default: ``False``.
+            src_key_padding_mask: the mask for the src keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        src_key_padding_mask = F._canonical_mask(
+            mask=src_key_padding_mask,
+            mask_name="src_key_padding_mask",
+            other_type=F._none_or_dtype(mask),
+            other_name="mask",
+            target_type=src.dtype
+        )
+
+        mask = F._canonical_mask(
+            mask=mask,
+            mask_name="mask",
+            other_type=None,
+            other_name="",
+            target_type=src.dtype,
+            check_other=False,
+        )
+
+        output = src
+        convert_to_nested = False
+        first_layer = self.layers[0]
+        src_key_padding_mask_for_layers = src_key_padding_mask
+        why_not_sparsity_fast_path = ''
+        str_first_layer = "self.layers[0]"
+        if not isinstance(first_layer, torch.nn.TransformerEncoderLayer):
+            why_not_sparsity_fast_path = f"{str_first_layer} was not TransformerEncoderLayer"
+        elif first_layer.norm_first:
+            why_not_sparsity_fast_path = f"{str_first_layer}.norm_first was True"
+        elif first_layer.training:
+            why_not_sparsity_fast_path = f"{str_first_layer} was in training mode"
+        elif not first_layer.self_attn.batch_first:
+            why_not_sparsity_fast_path = f" {str_first_layer}.self_attn.batch_first was not True"
+        elif not first_layer.self_attn._qkv_same_embed_dim:
+            why_not_sparsity_fast_path = f"{str_first_layer}.self_attn._qkv_same_embed_dim was not True"
+        elif not first_layer.activation_relu_or_gelu:
+            why_not_sparsity_fast_path = f" {str_first_layer}.activation_relu_or_gelu was not True"
+        elif not (first_layer.norm1.eps == first_layer.norm2.eps):
+            why_not_sparsity_fast_path = f"{str_first_layer}.norm1.eps was not equal to {str_first_layer}.norm2.eps"
+        elif not src.dim() == 3:
+            why_not_sparsity_fast_path = f"input not batched; expected src.dim() of 3 but got {src.dim()}"
+        elif not self.enable_nested_tensor:
+            why_not_sparsity_fast_path = "enable_nested_tensor was not True"
+        elif src_key_padding_mask is None:
+            why_not_sparsity_fast_path = "src_key_padding_mask was None"
+        elif (((not hasattr(self, "mask_check")) or self.mask_check)
+              and not torch._nested_tensor_from_mask_left_aligned(src, src_key_padding_mask.logical_not())):
+            why_not_sparsity_fast_path = "mask_check enabled, and src and src_key_padding_mask was not left aligned"
+        elif output.is_nested:
+            why_not_sparsity_fast_path = "NestedTensor input is not supported"
+        elif mask is not None:
+            why_not_sparsity_fast_path = "src_key_padding_mask and mask were both supplied"
+        elif first_layer.self_attn.num_heads % 2 == 1:
+            why_not_sparsity_fast_path = "num_head is odd"
+        elif torch.is_autocast_enabled():
+            why_not_sparsity_fast_path = "autocast is enabled"
+
+        if not why_not_sparsity_fast_path:
+            tensor_args = (
+                src,
+                first_layer.self_attn.in_proj_weight,
+                first_layer.self_attn.in_proj_bias,
+                first_layer.self_attn.out_proj.weight,
+                first_layer.self_attn.out_proj.bias,
+                first_layer.norm1.weight,
+                first_layer.norm1.bias,
+                first_layer.norm2.weight,
+                first_layer.norm2.bias,
+                first_layer.linear1.weight,
+                first_layer.linear1.bias,
+                first_layer.linear2.weight,
+                first_layer.linear2.bias,
+            )
+
+            if torch.overrides.has_torch_function(tensor_args):
+                why_not_sparsity_fast_path = "some Tensor argument has_torch_function"
+            elif not (src.is_cuda or 'cpu' in str(src.device)):
+                why_not_sparsity_fast_path = "src is neither CUDA nor CPU"
+            elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args):
+                why_not_sparsity_fast_path = ("grad is enabled and at least one of query or the "
+                                              "input/output projection weights or biases requires_grad")
+
+            if (not why_not_sparsity_fast_path) and (src_key_padding_mask is not None):
+                convert_to_nested = True
+                output = torch._nested_tensor_from_mask(output, src_key_padding_mask.logical_not(), mask_check=False)
+                src_key_padding_mask_for_layers = None
+
+        # Prevent type refinement
+        make_causal = (is_causal is True)
+
+        if is_causal is None:
+            if mask is not None:
+                sz = mask.size(0)
+                causal_comparison = torch.triu(
+                    torch.ones(sz, sz, device=mask.device) * float('-inf'), diagonal=1
+                ).to(mask.dtype)
+
+                if torch.equal(mask, causal_comparison):
+                    make_causal = True
+
+        is_causal = make_causal
+
+        for index, mod in enumerate(self.layers):
+            output = mod(
+                output,
+                src_mask=mask,
+                layer_index=index,
+                is_causal=is_causal,
+                src_key_padding_mask=src_key_padding_mask_for_layers,
+            )
+
+        if convert_to_nested:
+            output = output.to_padded_tensor(0.)
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output
+
+
 class GeneEncoder(nn.Module):
     def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: Optional[int] = None,
+            self,
+            num_embeddings: int,
+            embedding_dim: int,
+            padding_idx: Optional[int] = None,
     ):
         super().__init__()
         self.embedding = nn.Embedding(
@@ -762,6 +1201,9 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+
+
+
 class ContinuousValueEncoder(nn.Module):
     """
     Encode real number values to a vector using neural nets projection.
@@ -794,10 +1236,10 @@ class ContinuousValueEncoder(nn.Module):
 
 class CategoryValueEncoder(nn.Module):
     def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: Optional[int] = None,
+            self,
+            num_embeddings: int,
+            embedding_dim: int,
+            padding_idx: Optional[int] = None,
     ):
         super().__init__()
         self.embedding = nn.Embedding(
@@ -814,10 +1256,10 @@ class CategoryValueEncoder(nn.Module):
 
 class BatchLabelEncoder(nn.Module):
     def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: Optional[int] = None,
+            self,
+            num_embeddings: int,
+            embedding_dim: int,
+            padding_idx: Optional[int] = None,
     ):
         super().__init__()
         self.embedding = nn.Embedding(
@@ -847,10 +1289,10 @@ class Similarity(nn.Module):
 
 class ExprDecoder(nn.Module):
     def __init__(
-        self,
-        d_model: int,
-        explicit_zero_prob: bool = False,
-        use_batch_labels: bool = False,
+            self,
+            d_model: int,
+            explicit_zero_prob: bool = False,
+            use_batch_labels: bool = False,
     ):
         super().__init__()
         d_in = d_model * 2 if use_batch_labels else d_model
@@ -893,11 +1335,11 @@ class ClsDecoder(nn.Module):
     """
 
     def __init__(
-        self,
-        d_model: int,
-        n_cls: int,
-        nlayers: int = 3,
-        activation: callable = nn.ReLU,
+            self,
+            d_model: int,
+            n_cls: int,
+            nlayers: int = 3,
+            activation: callable = nn.ReLU,
     ):
         super().__init__()
         # module list
@@ -924,13 +1366,13 @@ class MVCDecoder(nn.Module):
     """
 
     def __init__(
-        self,
-        d_model: int,
-        arch_style: str = "inner product",
-        query_activation: nn.Module = nn.Sigmoid,
-        hidden_activation: nn.Module = nn.PReLU,
-        explicit_zero_prob: bool = False,
-        use_batch_labels: bool = False,
+            self,
+            d_model: int,
+            arch_style: str = "inner product",
+            query_activation: nn.Module = nn.Sigmoid,
+            hidden_activation: nn.Module = nn.PReLU,
+            explicit_zero_prob: bool = False,
+            use_batch_labels: bool = False,
     ) -> None:
         """
         Args:
@@ -970,7 +1412,7 @@ class MVCDecoder(nn.Module):
         self.explicit_zero_prob = explicit_zero_prob
 
     def forward(
-        self, cell_emb: Tensor, gene_embs: Tensor
+            self, cell_emb: Tensor, gene_embs: Tensor
     ) -> Union[Tensor, Dict[str, Tensor]]:
         """
         Args:
@@ -1016,12 +1458,12 @@ class AdversarialDiscriminator(nn.Module):
     """
 
     def __init__(
-        self,
-        d_model: int,
-        n_cls: int,
-        nlayers: int = 3,
-        activation: callable = nn.LeakyReLU,
-        reverse_grad: bool = False,
+            self,
+            d_model: int,
+            n_cls: int,
+            nlayers: int = 3,
+            activation: callable = nn.LeakyReLU,
+            reverse_grad: bool = False,
     ):
         super().__init__()
         # module list
@@ -1043,3 +1485,38 @@ class AdversarialDiscriminator(nn.Module):
         for layer in self._decoder:
             x = layer(x)
         return self.out_layer(x)
+import torch
+import torch.nn as nn
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm)
+
+    Args:
+        dim (int): 输入特征的维度
+        eps (float): 防止除零的epsilon值，默认为1e-6
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim      # 需要规范化的特征维度
+        self.eps = eps      # 稳定系数
+        self.weight = nn.Parameter(torch.ones(dim))  # 可学习的缩放参数
+
+    def forward(self, x: torch.Tensor):
+        """
+        前向传播过程
+
+        Args:
+            x (torch.Tensor): 输入张量，形状为 (..., dim)
+
+        Returns:
+            torch.Tensor: 归一化后的张量，形状与输入相同
+        """
+        # 步骤1：计算均方根值（RMS）
+        rms = torch.sqrt(
+            x.pow(2).mean(dim=-1, keepdim=True)
+            + self.eps ) # 添加epsilon防止除零
+
+        # 步骤2：归一化并缩放
+        x_normalized = x / rms          # 归一化（无中心化）
+        return self.weight * x_normalized  # 应用可学习权重

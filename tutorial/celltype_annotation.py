@@ -53,7 +53,7 @@ hyperparameter_defaults = dict(
     ecs_thres=0.0,  # Elastic cell similarity objective, 0.0 to 1.0, 0.0 to disable
     dab_weight=0.0,
     lr=1e-4,
-    batch_size=10,
+    batch_size=30,
     dropout=0.2,  # dropout probability
     schedule_ratio=0.9,  # ratio of epochs for learning rate schedule
     save_eval_interval=5,
@@ -63,10 +63,12 @@ hyperparameter_defaults = dict(
     include_zero_gene=False,
     freeze=False,  # freeze
     DSBN=False,  # Domain-spec batchnorm
-    struct=["sharedExpert"],
+    struct=["lora_rank",],
+    # struct=["sharedExpert"],
     # Whether using Parameter-Efficient Fine-Tuning,
     # False to disable, HYBRID/ENCODER/TOKEN/PREFIX/LORA are available for selection
 )
+
 config = argparse.Namespace(**hyperparameter_defaults)
 save_dir = Path(f"./save/{config.dataset_name}/{'_'.join(config.struct)}_{time.strftime('%b%d-%H')}/")
 save_dir.mkdir(parents=True, exist_ok=True)
@@ -162,7 +164,6 @@ dataset_name = config.dataset_name
 
 if dataset_name == "ms":
     data_dir = Path("../dataset/ms")
-
     adata = sc.read(data_dir / "0/ms_train0.h5ad")
     adata_val = sc.read(data_dir / "0/ms_val0.h5ad")
     adata_test = sc.read(data_dir / "0/ms_test0.h5ad")
@@ -218,11 +219,17 @@ if config.load_model is not None:
         f"Resume model from {model_file}, the model args will override the "
         f"config {model_config_file}."
     )
+
     embsize = model_configs["embsize"]
     nhead = model_configs["nheads"]
     d_hid = model_configs["d_hid"]
     nlayers = model_configs["nlayers"]
     n_layers_cls = model_configs["n_layers_cls"]
+    qkv_rank=model_configs["qkv_rank"]
+    out_rank=model_configs["out_rank"]
+    config_save_path = save_dir / "config.json"
+    with open(config_save_path, 'w') as f:
+        json.dump(model_configs, f, indent=4)
 # set up the preprocessor, use the args to config the workflow
 preprocessor = Preprocessor(
     use_key="X",  # the key in adata.layers to use as raw data
@@ -457,6 +464,10 @@ model = TransformerModel(
     use_fast_transformer=fast_transformer,
     fast_transformer_backend=fast_transformer_backend,
     pre_norm=config.pre_norm,
+    struct=config.struct,
+    qkv_rank=qkv_rank,
+    out_rank=out_rank
+
 )
 if config.load_model is not None:
     model=load_pretrained(model, torch.load(model_file))
@@ -901,15 +912,16 @@ def test(model: nn.Module, adata: DataLoader) -> float:
     )
 
     # compute accuracy, precision, recall, f1
-    from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score, f1_score
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-    accuracy = balanced_accuracy_score(celltypes_labels, predictions)
+    # accuracy = balanced_accuracy_score(celltypes_labels, predictions)
+    accuracy = accuracy_score(celltypes_labels, predictions)
     precision = precision_score(celltypes_labels, predictions, average="macro")
     recall = recall_score(celltypes_labels, predictions, average="macro")
     macro_f1 = f1_score(celltypes_labels, predictions, average="macro")
 
     logger.info(
-        f"Balanced accuracy: {accuracy:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}, "
+        f"accuracy: {accuracy:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}, "
         f"Macro F1: {macro_f1:.3f}"
     )
 
