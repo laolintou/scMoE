@@ -51,5 +51,8 @@
   "local_rank": 0,
   "gpu": 0,
   "qkv_rank":256,
-  "out_rank":null
+  "out_rank":null,
+  "moe_inter_dim": 256,
+  "score_func":"softmax",
+  "n_activated_experts":16
 }
