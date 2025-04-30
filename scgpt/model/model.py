@@ -28,6 +28,12 @@ from .dsbn import DomainSpecificBatchNorm1d
 from .grad_reverse import grad_reverse
 
 
+
+
+
+
+
+
 class TransformerModel(nn.Module):
     def __init__(
             self,
@@ -59,7 +65,14 @@ class TransformerModel(nn.Module):
             struct:list=[],
             qkv_rank: Any=None,
             out_rank: Any=None,
-
+            moe_inter_dim:int=256,
+            score_func :str="softmax",
+            n_routed_experts:int=16,
+            n_activated_experts:int=2,
+            n_shared_experts:int=2,
+            route_scale:float=1.0,
+            top_p:Any=None,
+            h_MoE:bool=False
     ):
         super().__init__()
         self.model_type = "Transformer"
@@ -139,14 +152,6 @@ class TransformerModel(nn.Module):
                 )
                 self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
         else:
-            # # Using original TransformerEncoder architecture if not use peft
-            # # if all(value is False for value in peft_config.values()):
-            #     encoder_layers = TransformerEncoderLayer(
-            #         d_model, nhead, d_hid, dropout, batch_first=True
-            #     )
-            #     self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
-            # # else:
-            #     # Using peft TransformerEncoder architecture if use peft
                 encoder_layers = nn.ModuleList(
                     [
                         MoETransformerEncoderLayer(
@@ -159,11 +164,19 @@ class TransformerModel(nn.Module):
                             struct=self.struct,
                             qkv_rank=self.qkv_rank,
                             out_rank=self.out_rank,
+                            moe_inter_dim=moe_inter_dim,
+                            score_func=score_func,
+                            n_routed_experts=n_routed_experts,
+                            n_activated_experts=n_activated_experts,
+                            n_shared_experts=n_shared_experts,
+                            route_scale=route_scale,
+                            top_p=top_p,
+                            h_MoE=h_MoE
                         )
                         for index in range(nlayers)
                     ]
                 )
-                self.transformer_encoder = PeftTransformerEncoder(encoder_layers)
+                self.transformer_encoder = MoETransformerEncoder(encoder_layers)
 
         self.decoder = ExprDecoder(
             d_model,
@@ -808,6 +821,8 @@ class MoETransformerEncoderLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,struct:list=[],
                  layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
+                 n_routed_experts=16,moe_inter_dim=1024,n_activated_experts:int=2,n_shared_experts:int=2,
+                 score_func:str="softmax",route_scale:float=1.0,top_p:Any=None,h_MoE:bool=False,
                  device=None, dtype=None, qkv_rank:int=0,out_rank:int=0,index: int = None, **kwargs) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
@@ -816,11 +831,15 @@ class MoETransformerEncoderLayer(nn.Module):
         else:
             self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first,
                                                 **factory_kwargs)
-
+        self.struct=struct
         # Implementation of Feedforward model
-        self.linear1 = Linear(d_model, dim_feedforward, **factory_kwargs)
-        self.dropout = Dropout(dropout)
-        self.linear2 = Linear(dim_feedforward, d_model, **factory_kwargs)
+        if "MoE" in struct:
+            self.ffn = MoE(d_model,moe_inter_dim,n_routed_experts,n_activated_experts,n_shared_experts,score_func,route_scale,top_p,h_MoE)
+        else:
+
+            self.linear1 = Linear(d_model, dim_feedforward, **factory_kwargs)
+            self.dropout = Dropout(dropout)
+            self.linear2 = Linear(dim_feedforward, d_model, **factory_kwargs)
 
         self.norm_first = norm_first
         if "RMSNorm" in struct:
@@ -845,6 +864,10 @@ class MoETransformerEncoderLayer(nn.Module):
         else:
             self.activation_relu_or_gelu = 0
         self.activation = activation
+
+
+
+
 
     def __setstate__(self, state):
         super().__setstate__(state)
@@ -972,11 +995,16 @@ class MoETransformerEncoderLayer(nn.Module):
         x = src
         if self.norm_first:
             x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, is_causal=is_causal)
-            x = x + self._ff_block(self.norm2(x))
+            if "MoE" in self.struct:
+                x = x + self.ffn(self.norm2(x))
+            else:
+                x = x + self._ff_block(self.norm2(x))
         else:
             x = self.norm1(x + self._sa_block(x, src_mask, src_key_padding_mask, is_causal=is_causal))
-            x = self.norm2(x + self._ff_block(x))
-
+            if "MoE" in self.struct:
+                x = self.norm2(x + self.ffn(x))
+            else:
+                x = self.norm2(x + self._ff_block(x))
         return x
 
     # self-attention block
@@ -994,7 +1022,7 @@ class MoETransformerEncoderLayer(nn.Module):
         return self.dropout2(x)
 
 
-class PeftTransformerEncoder(nn.Module):
+class MoETransformerEncoder(nn.Module):
     r"""TransformerEncoder is a stack of N encoder layers. Users can build the
     BERT(https://arxiv.org/abs/1810.04805) model with corresponding parameters.
 
@@ -1485,8 +1513,7 @@ class AdversarialDiscriminator(nn.Module):
         for layer in self._decoder:
             x = layer(x)
         return self.out_layer(x)
-import torch
-import torch.nn as nn
+
 
 class RMSNorm(nn.Module):
     """
@@ -1520,3 +1547,167 @@ class RMSNorm(nn.Module):
         # 步骤2：归一化并缩放
         x_normalized = x / rms          # 归一化（无中心化）
         return self.weight * x_normalized  # 应用可学习权重
+
+
+class Expert(nn.Module):
+    """基础专家模块实现"""
+
+    def __init__(self, dim: int, intermediate_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, intermediate_dim),
+            nn.GELU(),
+            nn.Linear(intermediate_dim, dim)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+class Gate(nn.Module):
+    """改进后的门控机制，支持向量化 top-p 路由"""
+
+    def __init__(self,
+                 dim: int,
+                 n_routed_experts: int,
+                 n_activated_experts: int,
+                 score_func: str,
+                 route_scale: float,
+                 top_p: Optional[float] = None):
+        super().__init__()
+        self.dim = dim
+        self.topk = n_activated_experts
+        self.score_func = score_func
+        self.route_scale = route_scale
+        self.top_p = top_p
+        self.gate_layer = nn.Linear(dim, n_routed_experts)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for the gating mechanism.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - Routing weights of shape (batch_size, seq_len, n_routed_experts).
+                - Boolean mask indicating selected experts of shape (batch_size, seq_len, n_routed_experts).
+        """
+        # Compute scores
+        scores = self.gate_layer(x)  # Shape: [batch_size, seq_len, n_routed_experts]
+
+        # Apply scoring function
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        else:
+            scores = scores.sigmoid()
+
+        # Initialize boolean mask for selected experts
+        batch_size, seq_len, n_routed_experts = scores.shape
+        selected_mask = torch.zeros_like(scores, dtype=torch.bool)
+
+        if self.top_p is not None:
+            # Top-p selection
+            sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_scores, dim=-1)
+
+            # Create a mask where cumulative probability exceeds top_p
+            exceed_mask = cumulative_probs >= self.top_p
+            first_exceed_idx = exceed_mask.long().argmax(dim=-1)  # Shape: [batch_size, seq_len]
+
+            # Ensure at least one expert is selected
+            num_selected = torch.where(
+                exceed_mask.any(dim=-1),  # If any expert exceeds top_p
+                first_exceed_idx + 1,  # Select up to the first exceed index
+                torch.tensor(1, device=x.device)  # Otherwise, select at least one expert
+            )
+
+            # Generate boolean mask using arange and comparison
+            max_experts = scores.size(-1)
+            indices = torch.arange(max_experts, device=x.device).unsqueeze(0).unsqueeze(0)  # Shape: [1, 1, max_experts]
+            num_selected_expanded = num_selected.unsqueeze(-1)  # Shape: [batch_size, seq_len, 1]
+            selected_mask = indices < num_selected_expanded  # Shape: [batch_size, seq_len, max_experts]
+
+            # Reorder the mask according to sorted_indices
+            selected_mask = selected_mask.scatter(-1, sorted_indices, selected_mask)
+
+        else:
+            # Top-k selection
+            topk_values, topk_indices = torch.topk(scores, self.topk, dim=-1)
+            selected_mask.scatter_(-1, topk_indices, True)
+
+        # Normalize weights if using sigmoid
+        if self.score_func == "sigmoid":
+            scores = scores / scores.sum(dim=-1, keepdim=True)
+
+        # Scale weights
+        scores = scores * self.route_scale
+
+        return scores, selected_mask
+
+
+class MoE(nn.Module):
+    """
+    Mixture-of-Experts (MoE) module with simplified gating.
+    """
+
+    def __init__(self, dim: int, moe_inter_dim: int, n_routed_experts: int,
+                 n_activated_experts: int, n_shared_experts: int,
+                 score_func: str, route_scale: float, top_p: Optional[float] = None,h_MoE:bool=False,):
+        super().__init__()
+        self.dim = dim
+        self.n_routed_experts = n_routed_experts
+        self.gate = Gate(dim, n_routed_experts, n_activated_experts, score_func, route_scale, top_p)
+        if h_MoE:
+            d = 16
+            middle_index = n_routed_experts // 2
+            # 生成每个专家的 moe_inter_dim 列表
+            expert_dims = []
+            for i in range(n_routed_experts):
+                expert_dims.append(moe_inter_dim + (i - middle_index) * d)
+            self.experts = nn.ModuleList([Expert(dim, expert_dim) for expert_dim in expert_dims])
+            # self.experts = nn.ModuleList([Expert(dim, moe_inter_dim) for _ in range(n_routed_experts)])
+        else:
+            self.experts = nn.ModuleList([Expert(dim, moe_inter_dim) for _ in range(n_routed_experts)])
+        self.shared_experts = Expert(dim, n_shared_experts * moe_inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the MoE module.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
+
+        Returns:
+            torch.Tensor: Output tensor after expert routing and computation.
+        """
+        batch_size, seq_len, dim = x.shape
+
+        # Compute gating weights and selected mask
+        weights, selected_mask = self.gate(x)  # weights: [batch, seq, n_routed], mask: [batch, seq, n_routed]
+
+        # Flatten the input for batch processing
+        flat_x = x.view(-1, dim)  # Shape: [batch_size * seq_len, dim]
+        flat_weights = weights.view(-1, self.n_routed_experts)  # Shape: [batch_size * seq_len, n_routed]
+        flat_mask = selected_mask.view(-1, self.n_routed_experts)  # Shape: [batch_size * seq_len, n_routed]
+
+        # Initialize output tensor with zeros
+        y = torch.zeros_like(flat_x)
+
+        # Process all experts in parallel
+        expert_outputs = torch.stack([expert(flat_x) for expert in self.experts], dim=1)  # Shape: [batch_size * seq_len, n_routed, dim]
+
+        # Apply the mask and weights
+        weighted_outputs = expert_outputs * flat_weights.unsqueeze(-1) * flat_mask.unsqueeze(-1)
+        y = weighted_outputs.sum(dim=1)  # Shape: [batch_size * seq_len, dim]
+
+        # Reshape back to original shape
+        y = y.view(batch_size, seq_len, dim)
+
+        # Apply shared experts to all tokens
+        z = self.shared_experts(x)
+
+        return y + z
+
+
