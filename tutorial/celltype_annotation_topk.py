@@ -42,9 +42,9 @@ os.environ["KMP_WARNINGS"] = "off"
 warnings.filterwarnings('ignore')
 hyperparameter_defaults = dict(
     seed=0,
-    dataset_name="MergedMonkey",
+    dataset_name="MYE",
     do_train=True,
-    load_model="../scGPT_human",
+    load_model="../scGPT_human_topk",
     mask_ratio=0.0,
     epochs=50,
     n_bins=51,
@@ -52,7 +52,7 @@ hyperparameter_defaults = dict(
     ecs_thres=0.0,  # Elastic cell similarity objective, 0.0 to 1.0, 0.0 to disable
     dab_weight=0.0,
     lr=1e-4,
-    batch_size=20,
+    batch_size=50,
     dropout=0.2,  # dropout probability
     schedule_ratio=0.9,  # ratio of epochs for learning rate schedule
     save_eval_interval=5,
@@ -64,7 +64,7 @@ hyperparameter_defaults = dict(
     DSBN=False,  # Domain-spec batchnorm
     # struct=["lora_rank","MoE"],
     struct=["MoE"],
-    experiment="MoE expert=4 topp=0.5"
+    experiment="expert=8 topk=2"
 )
 
 config = argparse.Namespace(**hyperparameter_defaults)
@@ -153,36 +153,34 @@ if ADV and DAB:
     raise ValueError("ADV and DAB cannot be both True.")
 DAB_separate_optim = True if DAB > 1 else False
 dataset_name = config.dataset_name
-
+log_save_dir = Path(f"./save/{config.dataset_name}/{config.experiment}/")
+log_save_dir.mkdir(parents=True, exist_ok=True)
+logger = scg.logger
+scg.utils.add_file_handler(logger, log_save_dir / "run.log")
 for fold in range(5):
-    save_dir = Path(f"./save/{config.dataset_name}/{config.experiment}_{time.strftime('%b%d-%H-%M')}/{fold}")
+    save_dir = Path(f"./save/{config.dataset_name}/{config.experiment}/{fold}")
     save_dir.mkdir(parents=True, exist_ok=True)
-    logger = scg.logger
-    scg.utils.add_file_handler(logger, save_dir / "run.log")
-
     logger.info(config)
     if dataset_name == "ms":
         data_dir = Path("../dataset/ms")
         adata = sc.read(data_dir / "0/ms_train0.h5ad")
         adata_val = sc.read(data_dir / "0/ms_val0.h5ad")
         adata_test = sc.read(data_dir / "0/ms_test0.h5ad")
-
         adata.obs["batch_id"] = adata.obs["str_batch"] = "0"
         adata_val.obs["batch_id"] = adata_val.obs["str_batch"] = "1"
         adata_test.obs["batch_id"] = adata_test.obs["str_batch"] = "2"
-
         adata.var.set_index(adata.var["gene_name"], inplace=True)
         adata_val.var.set_index(adata_val.var["gene_name"], inplace=True)
         adata_test.var.set_index(adata_test.var["gene_name"], inplace=True)
-
         data_is_raw = False
         filter_gene_by_counts = False
         adata_test_raw = adata_test.copy()
         adata = adata.concatenate((adata_val, adata_test), batch_key="str_batch")
     elif dataset_name == "MergedMonkey":
-        adata = sc.read(data_dir / f"{i}/MergedMonkey_train{i}.h5ad")
-        adata_val = sc.read(data_dir / f"{i}/MergedMonkey_val{i}.h5ad")
-        adata_test = sc.read(data_dir / f"{i}/MergedMonkey_test{i}.h5ad")
+        data_dir = Path(f"../dataset/{dataset_name}")
+        adata = sc.read(data_dir / f"{fold}/MergedMonkey_train{fold}.h5ad")
+        adata_val = sc.read(data_dir / f"{fold}/MergedMonkey_val{fold}.h5ad")
+        adata_test = sc.read(data_dir / f"{fold}/MergedMonkey_test{fold}.h5ad")
         adata.obs["celltype"] = adata.obs["CellType"].astype("category")
         adata_val.obs["celltype"] = adata_val.obs["CellType"].astype("category")
         adata_test.obs["celltype"] = adata_test.obs["CellType"].astype("category")
@@ -196,6 +194,30 @@ for fold in range(5):
         filter_gene_by_counts = False
         adata_test_raw = adata_test.copy()
         adata = adata.concatenate((adata_test, adata_val), batch_key="str_batch")
+    elif dataset_name=="MYE":
+        data_dir = Path(f"../data/{dataset_name}")
+        adata = sc.read(data_dir / f"cross_validation/fold_{fold}/train_adata.h5ad")
+        adata_val = sc.read(data_dir / f"cross_validation/fold_{fold}/val_adata.h5ad")
+        adata_test = sc.read(data_dir / f"cross_validation/fold_{fold}/test_adata.h5ad")
+        adata.obs["celltype"] = adata.obs["cell_type"].astype("category")
+        adata_val.obs["celltype"] = adata_val.obs["cell_type"].astype("category")
+        adata_test.obs["celltype"] = adata_test.obs["cell_type"].astype("category")
+        adata.obs["batch_id"] = adata.obs["str_batch"] = "0"
+        adata_test.obs["batch_id"] = adata_test.obs["str_batch"] = "1"
+        adata_val.obs["batch_id"] = adata_val.obs["str_batch"] = "2"
+        adata.var["gene_name"] = adata.var.index
+        adata_val.var["gene_name"] = adata_val.var.index
+        adata_test.var["gene_name"] = adata_test.var.index
+        adata.var.set_index(adata.var.index, inplace=True)
+        adata_val.var.set_index(adata_val.var.index, inplace=True)
+        adata_test.var.set_index(adata_test.var.index, inplace=True)
+        data_is_raw = False
+        filter_gene_by_counts = False
+        adata_test_raw = adata_test.copy()
+        adata = adata.concatenate((adata_test, adata_val), batch_key="str_batch")
+
+
+
     # make the batch category column
     batch_id_labels = adata.obs["str_batch"].astype("category").cat.codes.values
     adata.obs["batch_id"] = batch_id_labels
@@ -268,11 +290,12 @@ for fold in range(5):
         result_binned_key="X_binned",  # the key in adata.layers to store the binned data
     )
 
-    adata_test = adata[adata.obs["str_batch"] == "2"]
-    adata = adata[adata.obs["str_batch"] != "2"]
 
     preprocessor(adata, batch_key=None)
-    preprocessor(adata_test, batch_key=None)
+    adata_test = adata[adata.obs["str_batch"] == "1"]
+    adata = adata[adata.obs["str_batch"] != "1"]
+
+
     input_layer_key = {  # the values of this map coorespond to the keys in preprocessing
         "normed_raw": "X_normed",
         "log1p": "X_normed",
@@ -281,15 +304,15 @@ for fold in range(5):
 
     genes = adata.var["gene_name"].tolist()
     train_celltype_labels = adata[adata.obs["str_batch"] == "0"].obs["celltype_id"].values  # make sure count from 0
-    valid_celltype_labels = adata[adata.obs["str_batch"] == "1"].obs["celltype_id"].values  # make sure count from 0
+    valid_celltype_labels = adata[adata.obs["str_batch"] == "2"].obs["celltype_id"].values  # make sure count from 0
 
     batch_ids = adata.obs["batch_id"].tolist()
     num_batch_types = len(set(batch_ids))
 
     train_batch_labels = adata[adata.obs["str_batch"] == "0"].obs["batch_id"].values
-    valid_batch_labels = adata[adata.obs["str_batch"] == "1"].obs["batch_id"].values
+    valid_batch_labels = adata[adata.obs["str_batch"] == "2"].obs["batch_id"].values
 
-    adata_val = adata[adata.obs["str_batch"] == "1"]
+    adata_val = adata[adata.obs["str_batch"] == "2"]
     adata = adata[adata.obs["str_batch"] == "0"]
 
     train_data = (
@@ -458,7 +481,7 @@ for fold in range(5):
             sampler=sampler,
         )
         return data_loader
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 
     ntokens = len(vocab)  # size of vocabulary
     model = TransformerModel(

@@ -72,7 +72,7 @@ class TransformerModel(nn.Module):
             n_shared_experts:int=2,
             route_scale:float=1.0,
             top_p:Any=None,
-            h_MoE:bool=False
+            h_MoE:list=[]
     ):
         super().__init__()
         self.model_type = "Transformer"
@@ -822,7 +822,7 @@ class MoETransformerEncoderLayer(nn.Module):
                  activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,struct:list=[],
                  layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
                  n_routed_experts=16,moe_inter_dim=1024,n_activated_experts:int=2,n_shared_experts:int=2,
-                 score_func:str="softmax",route_scale:float=1.0,top_p:Any=None,h_MoE:bool=False,
+                 score_func:str="softmax",route_scale:float=1.0,top_p:Any=None,h_MoE:list=[],
                  device=None, dtype=None, qkv_rank:int=0,out_rank:int=0,index: int = None, **kwargs) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
@@ -1654,19 +1654,13 @@ class MoE(nn.Module):
 
     def __init__(self, dim: int, moe_inter_dim: int, n_routed_experts: int,
                  n_activated_experts: int, n_shared_experts: int,
-                 score_func: str, route_scale: float, top_p: Optional[float] = None,h_MoE:bool=False,):
+                 score_func: str, route_scale: float, top_p: Optional[float] = None,h_MoE:list=[],):
         super().__init__()
         self.dim = dim
         self.n_routed_experts = n_routed_experts
         self.gate = Gate(dim, n_routed_experts, n_activated_experts, score_func, route_scale, top_p)
-        if h_MoE:
-            d = 16
-            middle_index = n_routed_experts // 2
-            # 生成每个专家的 moe_inter_dim 列表
-            expert_dims = []
-            for i in range(n_routed_experts):
-                expert_dims.append(moe_inter_dim + (i - middle_index) * d)
-            self.experts = nn.ModuleList([Expert(dim, expert_dim) for expert_dim in expert_dims])
+        if h_MoE!=None:
+            self.experts = nn.ModuleList([Expert(dim, expert_dim) for expert_dim in h_MoE])
             # self.experts = nn.ModuleList([Expert(dim, moe_inter_dim) for _ in range(n_routed_experts)])
         else:
             self.experts = nn.ModuleList([Expert(dim, moe_inter_dim) for _ in range(n_routed_experts)])

@@ -1,13 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<module version="4">
-  <component name="PackageRequirementsSettings">
-    <option name="requirementsPath" value="" />
-  </component>
-  <component name="PyDocumentationSettings">
-    <option name="format" value="PLAIN" />
-    <option name="myDocStringFormat" value="Plain" />
-  </component>
-  <component name="TestRunnerService">
-    <option name="PROJECT_TEST_RUNNER" value="Unittests" />
+<module type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$" />
+    <orderEntry type="jdk" jdkName="Remote Python 3.8.0 (sftp://23zxy@210.47.18.59:22/home/23zxy/.conda/envs/Geneformer/bin/python3.8) (11)" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>
