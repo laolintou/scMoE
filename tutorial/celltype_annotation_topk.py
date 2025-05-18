@@ -63,7 +63,7 @@ hyperparameter_defaults = dict(
     freeze=False,  # freeze
     DSBN=False,  # Domain-spec batchnorm
     # struct=["lora_rank","MoE"],
-    struct=["MoE","RMS"],
+    struct=["MoE","RMSNorm"],
     experiment="expert=4 topk=1 moe_inter_dim=256_trainable"
 )
 
@@ -112,7 +112,7 @@ per_seq_batch_sample = False
 # settings for optimizer
 lr = config.lr  # TODO: test learning rate ratio between two tasks
 lr_ADV = 1e-3  # learning rate for discriminator, used when ADV is True
-early_stop = 10
+early_stop = 5
 batch_size = config.batch_size
 eval_batch_size = config.batch_size
 epochs = config.epochs
@@ -592,6 +592,15 @@ for fold in range(5):
         )
 
     scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
+
+
+    def load_balance_loss(gate_weights, num_experts):
+        # 计算专家利用率的方差
+        expert_utilization = gate_weights.mean(dim=0)
+        balance_loss = torch.std(expert_utilization) * num_experts  # 惩罚不均衡
+        return balance_loss
+
+
     def train(model: nn.Module, loader: DataLoader) -> None:
         """
         Train the model for one epoch.
@@ -614,6 +623,8 @@ for fold in range(5):
         start_time = time.time()
 
         num_batches = len(loader)
+        all_gate_probs = []  # 初始化 all_gate_probs
+
         for batch, batch_data in enumerate(loader):
             input_gene_ids = batch_data["gene_ids"].to(device)
             input_values = batch_data["values"].to(device)
@@ -623,6 +634,8 @@ for fold in range(5):
 
             src_key_padding_mask = input_gene_ids.eq(vocab[pad_token])
             with torch.cuda.amp.autocast(enabled=config.amp):
+                for layer in model.transformer_encoder.layers:
+                    layer.ffn.gate_probs_list = []
                 output_dict = model(
                     input_gene_ids,
                     input_values,
@@ -633,8 +646,10 @@ for fold in range(5):
                     MVC=MVC,
                     ECS=ECS,
                     do_sample=do_sample_in_train,
-                    #generative_training=False
+                    # generative_training=False
                 )
+                for layer in model.transformer_encoder.layers:
+                    all_gate_probs.append(torch.cat(layer.ffn.gate_probs_list, dim=0))
 
                 masked_positions = input_values.eq(mask_value)  # the postions to predict
                 loss = 0.0
@@ -687,6 +702,14 @@ for fold in range(5):
                     loss = loss + dab_weight * loss_dab
                     metrics_to_log.update({"train/dab": loss_dab.item()})
 
+                # 合并所有层的门控概率 [total_samples, num_experts]
+                all_gate_probs_tensor = torch.cat(all_gate_probs, dim=0)
+
+                # 计算负载均衡损失
+                balance_loss = load_balance_loss(all_gate_probs_tensor, n_routed_experts)
+                logger.info(f"balance_loss:{balance_loss}")
+                loss = loss +0.1*balance_loss  # 将负载均衡损失添加到总损失中
+
             model.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -718,7 +741,7 @@ for fold in range(5):
                     MVC=MVC,
                     ECS=ECS,
                     do_sample=do_sample_in_train,
-                    #generative_training=False
+                    # generative_training=False
                 )
 
                 # TRAINING DISCRIMINATOR
@@ -756,6 +779,7 @@ for fold in range(5):
                 loss_mvc_zero_log_prob.item() if MVC and explicit_zero_prob else 0.0
             )
             total_error += error_rate
+
             if batch % log_interval == 0 and batch > 0:
                 lr = scheduler.get_last_lr()[0]
                 ms_per_batch = (time.time() - start_time) * 1000 / log_interval
@@ -811,6 +835,18 @@ for fold in range(5):
                 total_mvc_zero_log_prob = 0
                 total_error = 0
                 start_time = time.time()
+
+        # 计算每个专家的平均激活概率
+        all_gate_probs_tensor = torch.cat(all_gate_probs, dim=0)
+        expert_usage = all_gate_probs_tensor.mean(dim=0).cpu().numpy()  # [num_experts,]
+        max_usage = expert_usage.max()
+        min_usage = expert_usage.min()
+        unused_experts = np.where(expert_usage < 1e-5)[0]  # 未激活专家索引
+
+        # 打印结果
+        logger.info(f"专家平均激活概率:{expert_usage}")
+        logger.info(f"是否有专家权重均值>0.8：{max_usage > 0.8}")
+        logger.info(f"未激活专家索引：{unused_experts.tolist()}")
 
 
     def evaluate(model: nn.Module, loader: DataLoader, return_raw: bool = False) -> float:
@@ -895,10 +931,34 @@ for fold in range(5):
         epoch_start_time = time.time()
 
         if config.do_train:
+            # all_gate_probs = []
+            #
+            # # 在模型前向传播前清空各层的 gate_probs_list
+            # for layer in model.transformer_encoder.layers:
+            #     layer.ffn.gate_probs_list = []
             train(
                 model,
                 loader=train_loader,
             )
+            # # 收集所有层的门控概率
+            # for layer in model.transformer_encoder.layers:
+            #     all_gate_probs.append(torch.cat(layer.ffn.gate_probs_list, dim=0))
+            #
+            # # 合并所有层的门控概率 [total_samples, num_experts]
+            # all_gate_probs = torch.cat(all_gate_probs, dim=0)
+            #
+            # # 计算每个专家的平均激活概率
+            # expert_usage = all_gate_probs.mean(dim=0).cpu().numpy()  # [num_experts,]
+            # max_usage = expert_usage.max()
+            # min_usage = expert_usage.min()
+            # unused_experts = np.where(expert_usage < 1e-5)[0]  # 未激活专家索引
+            #
+            # # 打印结果
+            # logger.info(f"专家平均激活概率:{expert_usage}", )
+            # logger.info(f"是否有专家权重均值>0.8：{max_usage > 0.8}")
+            # logger.info(f"未激活专家索引：{unused_experts.tolist()}")
+
+
         val_loss, val_err = evaluate(
             model,
             loader=valid_loader,

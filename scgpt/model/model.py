@@ -1665,6 +1665,7 @@ class MoE(nn.Module):
         else:
             self.experts = nn.ModuleList([Expert(dim, moe_inter_dim) for _ in range(n_routed_experts)])
         self.shared_experts = Expert(dim, n_shared_experts * moe_inter_dim)
+        self.gate_probs_list = []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1680,7 +1681,7 @@ class MoE(nn.Module):
 
         # Compute gating weights and selected mask
         weights, selected_mask = self.gate(x)  # weights: [batch, seq, n_routed], mask: [batch, seq, n_routed]
-
+        self.gate_probs_list.append(weights.detach().flatten(0, 1))  # [batch*seq_len, num_experts]
         # Flatten the input for batch processing
         flat_x = x.view(-1, dim)  # Shape: [batch_size * seq_len, dim]
         flat_weights = weights.view(-1, self.n_routed_experts)  # Shape: [batch_size * seq_len, n_routed]

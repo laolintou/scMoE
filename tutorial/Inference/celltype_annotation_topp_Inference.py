@@ -45,7 +45,7 @@ hyperparameter_defaults = dict(
     seed=0,
     dataset_name="MYE",
     do_train=True,
-    load_model="../scGPT_human_topp",
+    load_model="../../scGPT_human_topp",
     mask_ratio=0.0,
     epochs=50,
     n_bins=51,
@@ -199,7 +199,7 @@ for fold in range(5):
         adata_test_raw = adata_test.copy()
         adata = adata.concatenate((adata_test, adata_val), batch_key="str_batch")
     elif dataset_name=="MYE":
-        data_dir = Path(f"../data/{dataset_name}")
+        data_dir = Path(f"../../data/{dataset_name}")
         adata = sc.read(data_dir / f"cross_validation/fold_{fold}/train_adata.h5ad")
         adata_val = sc.read(data_dir / f"cross_validation/fold_{fold}/val_adata.h5ad")
         adata_test = sc.read(data_dir / f"cross_validation/fold_{fold}/test_adata.h5ad")
@@ -852,10 +852,9 @@ for fold in range(5):
                 total_num += len(input_gene_ids)
                 preds = output_values.argmax(1).cpu().numpy()
                 predictions.append(preds)
-
+        print(f"fold:{fold}_inference_time:{np.mean(np.array(inference_times))}")
         if return_raw:
             return np.concatenate(predictions, axis=0)
-        print(mean(inference_times))
         return total_loss / total_num, total_error / total_num
     train_data_pt, valid_data_pt = prepare_data(sort_seq_batch=per_seq_batch_sample)
 
@@ -882,7 +881,7 @@ for fold in range(5):
     )
     best_val_loss = float("inf")
     best_avg_bio = 0.0
-    best_model = None
+    best_model = model
     patience = 0
     # %% inference
     def test(model: nn.Module, adata: DataLoader) -> float:
