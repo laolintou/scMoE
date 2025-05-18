@@ -49,13 +49,13 @@
   "gpu": 0,
   "qkv_rank":256,
   "out_rank":null,
-  "moe_inter_dim": 256,
+  "moe_inter_dim": 512,
   "score_func":"softmax",
-  "n_routed_experts": 8,
+  "n_routed_experts": 4,
   "n_activated_experts":2,
   "n_shared_experts":2,
   "route_scale":1.0,
-  "top_p": 0.5,
+  "top_p": 0.4,
   "Hmoe":null
 
 }

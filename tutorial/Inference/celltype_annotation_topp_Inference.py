@@ -65,7 +65,7 @@ hyperparameter_defaults = dict(
     DSBN=False,  # Domain-spec batchnorm
     # struct=["lora_rank","MoE"],
     struct=["MoE"],
-    experiment="MoE expert=4 topp=0.4 5e-5 _"
+    experiment="MoE expert=4 topp=0.4 5e-5"
 )
 
 config = argparse.Namespace(**hyperparameter_defaults)
@@ -113,7 +113,7 @@ per_seq_batch_sample = False
 # settings for optimizer
 lr = config.lr  # TODO: test learning rate ratio between two tasks
 lr_ADV = 1e-3  # learning rate for discriminator, used when ADV is True
-early_stop = 10
+early_stop = 5
 batch_size = config.batch_size
 eval_batch_size = config.batch_size
 epochs = config.epochs
@@ -535,14 +535,7 @@ for fold in range(5):
 
     totalParaCount = sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values())
     logger.info("Total  Params: %.2fM" % (totalParaCount / 1e6,))
-    # for param in model.parameters():
-    #     param.requires_grad = False
-    # keywords = ('ffn')
-    # params_to_update = filter(lambda p: any(keyword in p[0] for keyword in keywords), model.named_parameters())
-    # for _, param in params_to_update:
-    #     param.requires_grad = True
-    # learnable_params = {k: v for k, v in model.named_parameters() if v.requires_grad}
-    # logger.info("learnable Params: %.2fM" % (learnable_params / 1e6,))
+
     model.to(device)
 
     if ADV:
@@ -552,14 +545,14 @@ for fold in range(5):
         ).to(device)
     # Assign a weight to each type of cell based on the proportion of cell types to facilitate better attention to fewer cell types during training
     class_num = np.unique(celltype_id_labels, return_counts=True)[1].tolist()
-    class_weight = torch.tensor([(1 - (x / sum(class_num))) ** 2 for x in class_num]).to(device)
-
-    criterion = masked_mse_loss
-    criterion_cls = nn.CrossEntropyLoss(weight=class_weight)
     # class_weight = torch.tensor([(1 - (x / sum(class_num))) ** 2 for x in class_num]).to(device)
     #
     # criterion = masked_mse_loss
     # criterion_cls = nn.CrossEntropyLoss(weight=class_weight)
+    class_weight = torch.tensor([(1 - (x / sum(class_num))) ** 2 for x in class_num]).to(device)
+
+    criterion = masked_mse_loss
+    criterion_cls = nn.CrossEntropyLoss(weight=class_weight)
     criterion_dab = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(
         model.parameters(), lr=lr, eps=1e-4 if config.amp else 1e-8
@@ -815,6 +808,7 @@ for fold in range(5):
         total_dab = 0.0
         total_num = 0
         predictions = []
+        inference_times=[]
         with torch.no_grad():
             for batch_data in loader:
                 input_gene_ids = batch_data["gene_ids"].to(device)
@@ -824,7 +818,11 @@ for fold in range(5):
                 celltype_labels = batch_data["celltype_labels"].to(device)
 
                 src_key_padding_mask = input_gene_ids.eq(vocab[pad_token])
+
                 with torch.cuda.amp.autocast(enabled=config.amp):
+                    starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    torch.cuda.synchronize()
+                    starter.record()
                     output_dict = model(
                         input_gene_ids,
                         input_values,
@@ -837,6 +835,10 @@ for fold in range(5):
                         do_sample=do_sample_in_train,
                         #generative_training = False,
                     )
+                    ender.record()
+                    torch.cuda.synchronize()
+                    inference_time = starter.elapsed_time(ender) / 1000
+                    inference_times.append(inference_time)
                     output_values = output_dict["cls_output"]
                     loss = criterion_cls(output_values, celltype_labels)
 
@@ -853,7 +855,7 @@ for fold in range(5):
 
         if return_raw:
             return np.concatenate(predictions, axis=0)
-
+        print(mean(inference_times))
         return total_loss / total_num, total_error / total_num
     train_data_pt, valid_data_pt = prepare_data(sort_seq_batch=per_seq_batch_sample)
 
@@ -882,45 +884,6 @@ for fold in range(5):
     best_avg_bio = 0.0
     best_model = None
     patience = 0
-
-    for epoch in range(1, epochs + 1):
-        epoch_start_time = time.time()
-
-        if config.do_train:
-            train(
-                model,
-                loader=train_loader,
-            )
-        val_loss, val_err = evaluate(
-            model,
-            loader=valid_loader,
-        )
-        elapsed = time.time() - epoch_start_time
-        logger.info("-" * 89)
-        logger.info(
-            f"| end of epoch {epoch:3d} | time: {elapsed:5.2f}s | "
-            f"valid loss/mse {val_loss:5.4f} | err {val_err:5.4f}"
-        )
-        logger.info("-" * 89)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model = copy.deepcopy(model)
-            best_model_epoch = epoch
-            logger.info(f"Best model with score {best_val_loss:5.4f}")
-            patience = 0
-        else:
-            patience += 1
-            if patience >= early_stop:
-                logger.info(f"Early stop at epoch {epoch}")
-                break
-
-        scheduler.step()
-        if DAB_separate_optim:
-            scheduler_dab.step()
-        if ADV:
-            scheduler_D.step()
-            scheduler_E.step()
     # %% inference
     def test(model: nn.Module, adata: DataLoader) -> float:
         all_counts = (
@@ -1000,26 +963,3 @@ for fold in range(5):
 
         return predictions, celltypes_labels, results
     predictions, labels, results = test(best_model, adata_test)
-
-    save_dict = {
-        "predictions": predictions,
-        "labels": labels,
-        "results": results,
-        "id_maps": id2type
-    }
-    with open(save_dir / "results.pkl", "wb") as f:
-        pickle.dump(save_dict, f)
-    # save the model into the save_dir
-    torch.save(best_model.state_dict(), save_dir / "model.pt")
-    from sklearn.metrics import confusion_matrix
-
-    celltypes = list(celltypes)
-    for i in set([id2type[p] for p in predictions]):
-        if i not in celltypes:
-            celltypes.remove(i)
-    cm = confusion_matrix(labels, predictions)
-    cm = cm.astype("float") / cm.sum(axis=1)[:, np.newaxis]
-    cm = pd.DataFrame(cm, index=celltypes[:cm.shape[0]], columns=celltypes[:cm.shape[1]])
-    plt.figure(figsize=(10, 10))
-    sns.heatmap(cm, annot=True, fmt=".1f", cmap="Blues")
-    plt.savefig(save_dir / "confusion_matrix.png", dpi=300)

@@ -158,7 +158,7 @@ log_save_dir = Path(f"./save/{config.dataset_name}/{config.experiment}/")
 log_save_dir.mkdir(parents=True, exist_ok=True)
 logger = scg.logger
 scg.utils.add_file_handler(logger, log_save_dir / "run.log")
-dims=[[128,128,128,128,256,256,256,256,256,256,512,512],[128,128,256,256,256,256,256,256,512,512,1024,1024],[128,128,256,256,256,256,320,320,512,512,1024,1024],[[128,128,256,256,256,256,320,320,320,320,512,512]]]
+dims=[[128,128,128,128,256,256,256,256,256,256,512,512],[128,128,256,256,256,256,256,256,512,512,1024,1024],[128,128,256,256,256,256,320,320,512,512,1024,1024],[128,128,256,256,256,256,320,320,320,320,512,512]]
 for fold in range(4):
     save_dir = Path(f"./save/{config.dataset_name}/{config.experiment}/{dims[fold]}")
     save_dir.mkdir(parents=True, exist_ok=True)

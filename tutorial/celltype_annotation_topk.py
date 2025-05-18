@@ -51,7 +51,7 @@ hyperparameter_defaults = dict(
     MVC=False,  # Masked value prediction for cell embedding
     ecs_thres=0.0,  # Elastic cell similarity objective, 0.0 to 1.0, 0.0 to disable
     dab_weight=0.0,
-    lr=1e-4,
+    lr=5e-5,
     batch_size=50,
     dropout=0.2,  # dropout probability
     schedule_ratio=0.9,  # ratio of epochs for learning rate schedule
@@ -63,8 +63,8 @@ hyperparameter_defaults = dict(
     freeze=False,  # freeze
     DSBN=False,  # Domain-spec batchnorm
     # struct=["lora_rank","MoE"],
-    struct=["MoE"],
-    experiment="expert=8 topk=2"
+    struct=["MoE","RMS"],
+    experiment="expert=4 topk=1 moe_inter_dim=256_trainable"
 )
 
 config = argparse.Namespace(**hyperparameter_defaults)
@@ -112,7 +112,7 @@ per_seq_batch_sample = False
 # settings for optimizer
 lr = config.lr  # TODO: test learning rate ratio between two tasks
 lr_ADV = 1e-3  # learning rate for discriminator, used when ADV is True
-early_stop = 5
+early_stop = 10
 batch_size = config.batch_size
 eval_batch_size = config.batch_size
 epochs = config.epochs
@@ -481,7 +481,7 @@ for fold in range(5):
             sampler=sampler,
         )
         return data_loader
-    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
 
     ntokens = len(vocab)  # size of vocabulary
     model = TransformerModel(
@@ -532,7 +532,29 @@ for fold in range(5):
 
     totalParaCount = sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values())
     logger.info("Total  Params: %.2fM" % (totalParaCount / 1e6,))
-
+    ####################################################
+    for param in model.parameters():
+        param.requires_grad = False
+    # keywords = ('experts',"shared_experts")
+    # params_to_update = filter(lambda p: any(keyword in p[0] for keyword in keywords), model.named_parameters())
+    # for _, param in params_to_update:
+    #     param.requires_grad = True
+    for name, para in model.named_parameters():
+        if 'lora_' in name:
+            para.requires_grad = True
+        if 'cls_decoder' in name:
+            para.requires_grad = True
+        if 'experts' in name:
+            para.requires_grad = True
+        if 'shared_experts' in name:
+            para.requires_grad = True
+    learnable_params = {k: v for k, v in model.named_parameters() if v.requires_grad == True}
+    for k, v in learnable_params.items():
+        logger.info(f"Learnable params {k} with shape {v.shape}")
+    learnable_params_count = sum(
+        dict((p.data_ptr(), p.numel()) for p in model.parameters() if p.requires_grad).values())
+    logger.info("learnable Params: %.2fM" % (learnable_params_count / 1e6,))
+    ##########################################################
     model.to(device)
 
     if ADV:
